@@ -5,10 +5,14 @@ import os
 from typing import Dict, List, Optional
 from urllib.parse import unquote
 import requests
+from bs4 import BeautifulSoup
 
 from llama_index.core.readers.base import BaseReader
 from llama_index.core.schema import Document
 from retrying import retry
+import urllib.parse
+import magic
+import mimetypes
 
 CONFLUENCE_API_TOKEN = "CONFLUENCE_API_TOKEN"
 CONFLUENCE_PASSWORD = "CONFLUENCE_PASSWORD"
@@ -323,115 +327,92 @@ class ConfluenceReader(BaseReader):
         return function(**kwargs)
 
     def process_page(self, page, include_attachments, text_maker):
-        logger.info("Processing " + self.base_url + page["_links"]["webui"])
+        logger.info("Processing page: %s, ID: %s", self.base_url + page["_links"]["webui"], page["id"])
+
+        text = text_maker.handle(page["body"]["export_view"]["value"])
+        logger.info("Initial page text processed from HTML")
 
         if include_attachments:
-            attachment_texts = self.process_attachment(page["id"])
+            logger.info("Processing attachments for page ID: %s", page["id"])
+            attachment_info_list, updated_text = self.process_attachment(page["id"], page["body"]["export_view"]["value"], text, text_maker)
         else:
-            attachment_texts = []
-        text = text_maker.handle(page["body"]["export_view"]["value"]) + "".join(
-            attachment_texts
-        )
+            attachment_info_list = []
+            updated_text = text
+
+        logger.info("Attachments processed and inlined in page text")
         return Document(
-            text=text,
+            text=updated_text,
             doc_id=page["id"],
             extra_info={
                 "title": page["title"],
                 "page_id": page["id"],
                 "status": page["status"],
                 "url": self.base_url + page["_links"]["webui"],
+                "attachments": attachment_info_list,
             },
         )
 
-    def process_attachment(self, page_id):
-        try:
-            pass
-        except ImportError:
-            raise ImportError(
-                "`pytesseract` or `pdf2image` or `Pillow` package not found, please run"
-                " `pip install pytesseract pdf2image Pillow`"
-            )
 
-        # depending on setup you may also need to set the correct path for poppler and tesseract
-        attachments = self.confluence.get_attachments_from_content(page_id)["results"]
-        texts = []
-        for attachment in attachments:
-            media_type = attachment["metadata"]["mediaType"]
-            absolute_url = self.base_url + attachment["_links"]["download"]
-            title = attachment["title"]
-            if media_type == "application/pdf":
-                logger.info("Processing PDF attachment " + absolute_url)
-                text = title + self.process_pdf(absolute_url)
-            elif (
-                media_type == "image/png"
-                or media_type == "image/jpg"
-                or media_type == "image/jpeg"
-                or media_type == "image/webp"
-            ):
-                logger.info("Processing image attachment " + absolute_url)
-                text = title + self.process_image(absolute_url)
-            elif (
-                media_type
-                == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            ):
-                logger.info("Processing Word document attachment " + absolute_url)
-                text = title + self.process_doc(absolute_url)
-            elif (
-                media_type == "application/vnd.ms-excel"
-                or media_type
-                == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                or media_type == "application/vnd.ms-excel.sheet.macroenabled.12"
-            ):
-                if title.endswith(".csv") or absolute_url.endswith(".csv"):
-                    logger.info("Processing CSV attachment " + absolute_url)
-                    text = title + self.process_csv(absolute_url)
-                else:
-                    logger.info("Processing XLS attachment " + absolute_url)
-                    text = title + self.process_xls(absolute_url)
-            elif media_type == "application/vnd.ms-excel.sheet.binary.macroenabled.12":
-                logger.info("Processing XLSB attachment " + absolute_url)
-                text = title + self.process_xlsb(absolute_url)
-            elif media_type == "text/csv":
-                logger.info("Processing CSV attachment " + absolute_url)
-                text = title + self.process_csv(absolute_url)
-            elif media_type == "application/vnd.ms-outlook":
-                logger.info("Processing Outlook message attachment " + absolute_url)
-                text = title + self.process_msg(absolute_url)
-            elif media_type == "text/html":
-                logger.info("  Processing HTML attachment " + absolute_url)
-                text = title + self.process_html(absolute_url)
-            elif media_type == "text/plain":
-                if title.endswith(".csv") or absolute_url.endswith(".csv"):
-                    logger.info("Processing CSV attachment " + absolute_url)
-                    text = title + self.process_csv(absolute_url)
-                else:
-                    logger.info("Processing Text attachment " + absolute_url)
-                    text = title + self.process_txt(absolute_url)
-            elif media_type == "image/svg+xml":
-                logger.info("Processing SVG attachment " + absolute_url)
-                text = title + self.process_svg(absolute_url)
-            elif (
-                media_type
-                == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                or media_type
-                == "application/vnd.ms-powerpoint.presentation.macroenabled.12"
-            ):
-                logger.info(
-                    "Processing PowerPoint attachment "
-                    + absolute_url
-                    + " ("
-                    + media_type
-                    + ")"
-                )
-                text = title + self.process_ppt(absolute_url)
+    def process_attachment(self, page_id, page_html, page_text, text_maker):
+        attachment_info_list = []
+        attachment_data = self.confluence.get_attachments_from_content(page_id)["results"]
+
+        soup = BeautifulSoup(page_html, "html.parser")
+        logger.info(f"Found {len(attachment_data)} attachments for page ID: {page_id}")
+
+        # Log the entire HTML content once to debug
+        logger.info(f"Page HTML content for debugging:\n{page_html}")
+
+        for attachment in attachment_data:
+            attachment_id = attachment["id"]
+            attachment_title = attachment["title"].strip()  # Ensure no leading/trailing whitespace
+            attachment_tag = f"![](confluence/{attachment_title})"
+            logger.info(f"Processing attachment '{attachment_title}' with ID '{attachment_id}'")
+
+            # Construct the URL for matching
+            attachment_url = self.base_url + attachment["_links"]["download"]
+            attachment_url_parsed = urllib.parse.urlparse(attachment_url).path
+
+            # Fetch the binary content of the attachment
+            response = self.confluence.request(path=attachment_url, absolute=True)
+            attachment_file = response.content
+
+            # No extension found, use magic to detect the file type
+            mime = magic.Magic(mime=True)
+            detected_mime_type = mime.from_buffer(attachment_file)
+
+            ext = mimetypes.guess_extension(detected_mime_type) or ".bin"
+
+            attachment_title = f"{attachment_id}{ext}"
+            attachment_tag = f"![](confluence/{attachment_title})"
+
+            # Find and replace img tags in the HTML based on the src attribute
+            img_tags = soup.find_all('img', src=lambda src: src and urllib.parse.urlparse(src).path == attachment_url_parsed)
+            if not img_tags:
+                logger.info(f"No matching <img> tags found for attachment '{attachment_title}' in page ID: {page_id}")
             else:
-                logger.info(
-                    f"Skipping unsupported attachment {absolute_url} of media_type {media_type}"
-                )
-                continue
-            texts.append(text)
+                for img_tag in img_tags:
+                    img_tag.insert_after(soup.new_string(attachment_tag))
+                    img_tag.decompose()
+                    logger.info(f"Replaced <img> tag for attachment '{attachment_title}' with markdown tag in page ID: {page_id}")
 
-        return texts
+            attachment_info = {
+                "id": attachment_id,
+                "title": attachment_title,
+                "media_type": attachment["metadata"]["mediaType"],
+                "file": attachment_file,
+                "url": attachment_url
+            }
+
+            attachment_info_list.append(attachment_info)
+            logger.info(f"Processed attachment '{attachment_title}' for page ID: {page_id}")
+
+        # Convert the modified HTML back to text
+        updated_text = text_maker.handle(str(soup))
+        logger.info("Updated page text with attachment tags")
+
+        return attachment_info_list, updated_text
+
 
     def process_pdf(self, link):
         try:
