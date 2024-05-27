@@ -360,59 +360,55 @@ class ConfluenceReader(BaseReader):
         soup = BeautifulSoup(page_html, "html.parser")
         logger.info(f"Found {len(attachment_data)} attachments for page ID: {page_id}")
 
-        # Log the entire HTML content once to debug
-        logger.info(f"Page HTML content for debugging:\n{page_html}")
-
         for attachment in attachment_data:
             attachment_id = attachment["id"]
-            attachment_title = attachment["title"].strip()  # Ensure no leading/trailing whitespace
+            attachment_title = attachment["title"].strip()
             attachment_tag = f"![](confluence/{attachment_title})"
             logger.info(f"Processing attachment '{attachment_title}' with ID '{attachment_id}'")
 
-            # Construct the URL for matching
             attachment_url = self.base_url + attachment["_links"]["download"]
             attachment_url_parsed = urllib.parse.urlparse(attachment_url).path
 
-            # Fetch the binary content of the attachment
-            response = self.confluence.request(path=attachment_url, absolute=True)
-            attachment_file = response.content
+            try:
+                response = self.confluence.request(path=attachment_url, absolute=True)
+                attachment_file = response.content
 
-            # No extension found, use magic to detect the file type
-            mime = magic.Magic(mime=True)
-            detected_mime_type = mime.from_buffer(attachment_file)
+                mime = magic.Magic(mime=True)
+                detected_mime_type = mime.from_buffer(attachment_file)
 
-            ext = mimetypes.guess_extension(detected_mime_type) or ".bin"
+                ext = mimetypes.guess_extension(detected_mime_type) or ".bin"
 
-            attachment_title = f"{attachment_id}{ext}"
-            attachment_tag = f"![](confluence/{attachment_title})"
+                attachment_title = f"{attachment_id}{ext}"
+                attachment_tag = f"![](confluence/{attachment_title})"
 
-            # Find and replace img tags in the HTML based on the src attribute
-            img_tags = soup.find_all('img', src=lambda src: src and urllib.parse.urlparse(src).path == attachment_url_parsed)
-            if not img_tags:
-                logger.info(f"No matching <img> tags found for attachment '{attachment_title}' in page ID: {page_id}")
-            else:
-                for img_tag in img_tags:
-                    img_tag.insert_after(soup.new_string(attachment_tag))
-                    img_tag.decompose()
-                    logger.info(f"Replaced <img> tag for attachment '{attachment_title}' with markdown tag in page ID: {page_id}")
+                img_tags = soup.find_all('img', src=lambda src: src and urllib.parse.urlparse(src).path == attachment_url_parsed)
+                if not img_tags:
+                    logger.info(f"No matching <img> tags found for attachment '{attachment_title}' in page ID: {page_id}")
+                else:
+                    for img_tag in img_tags:
+                        img_tag.insert_after(soup.new_string(attachment_tag))
+                        img_tag.decompose()
+                        logger.info(f"Replaced <img> tag for attachment '{attachment_title}' with markdown tag in page ID: {page_id}")
 
-            attachment_info = {
-                "id": attachment_id,
-                "title": attachment_title,
-                "media_type": attachment["metadata"]["mediaType"],
-                "file": attachment_file,
-                "url": attachment_url
-            }
+                attachment_info = {
+                    "id": attachment_id,
+                    "title": attachment_title,
+                    "media_type": attachment["metadata"]["mediaType"],
+                    "file": attachment_file,
+                    "url": attachment_url
+                }
 
-            attachment_info_list.append(attachment_info)
-            logger.info(f"Processed attachment '{attachment_title}' for page ID: {page_id}")
+                attachment_info_list.append(attachment_info)
+                logger.info(f"Processed attachment '{attachment_title}' for page ID: {page_id}")
 
-        # Convert the modified HTML back to text
+            except HTTPError as e:
+                logger.error(f"Error processing attachment '{attachment_title}' with ID '{attachment_id}' for page ID: {page_id}: {str(e)}")
+                continue
+
         updated_text = text_maker.handle(str(soup))
         logger.info("Updated page text with attachment tags")
 
         return attachment_info_list, updated_text
-
 
     def process_pdf(self, link):
         try:
