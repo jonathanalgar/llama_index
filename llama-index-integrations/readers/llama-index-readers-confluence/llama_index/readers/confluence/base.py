@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from urllib.parse import unquote
 import requests
 from bs4 import BeautifulSoup
+from requests.exceptions import RequestException
 
 from llama_index.core.readers.base import BaseReader
 from llama_index.core.schema import Document
@@ -401,8 +402,11 @@ class ConfluenceReader(BaseReader):
                 attachment_info_list.append(attachment_info)
                 logger.info(f"Processed attachment '{attachment_title}' for page ID: {page_id}")
 
-            except HTTPError as e:
+            except RequestException as e:
                 logger.error(f"Error processing attachment '{attachment_title}' with ID '{attachment_id}' for page ID: {page_id}: {str(e)}")
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error processing attachment '{attachment_title}' with ID '{attachment_id}' for page ID: {page_id}: {str(e)}")
                 continue
 
         updated_text = text_maker.handle(str(soup))
